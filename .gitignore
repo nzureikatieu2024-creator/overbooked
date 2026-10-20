@@ -1,0 +1,19 @@
+# environment and credentials: never commit
+.env
+.env.*
+.env*.local
+!.env.example
+*.pem
+*.key
+*.p12
+credentials*.json
+service-account*.json
+
+node_modules
+.next
+
+# build output and local tooling
+next-env.d.ts
+*.tsbuildinfo
+.vercel
+.DS_Store
