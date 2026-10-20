@@ -594,3 +594,20 @@ export function parseIcs(text: string, from: number, to: number): IcsResult {
   unique.sort((a, b) => a.start - b.start || a.title.localeCompare(b.title));
   return { occurrences: unique, calendarName, eventCount: events.length, skipped, warnings };
 }
+
+/**
+ * Default choices in the import preview. All-day events (holidays, "week 5", deadlines,
+ * asynchronous modules) are usually informational, so they are imported as non-blocking
+ * unless the user ticks "Blocks study". Without non-blocking support they start unselected,
+ * so nothing becomes unavailable by surprise.
+ */
+export function importDefaults(
+  o: Pick<IcsOccurrence, "allDay" | "free">,
+  duplicate: boolean,
+  canSaveNonBlocking: boolean,
+): { selected: boolean; blocking: boolean } {
+  const blocking = !o.allDay && !o.free;
+  if (duplicate || o.free) return { selected: false, blocking };
+  if (o.allDay) return { selected: canSaveNonBlocking, blocking: false };
+  return { selected: true, blocking };
+}

@@ -1,15 +1,15 @@
 "use client";
 
 import { useMemo, useState } from "react";
-import { formatClock, formatDay, sameDay } from "@/lib/format";
-import { parseIcs, type IcsOccurrence, type IcsResult } from "@/lib/ics";
-import type { BusyRow } from "@/lib/types";
+import { formatClock, formatDay, isAllDay, sameDay } from "@/lib/format";
+import { importDefaults, parseIcs, type IcsOccurrence, type IcsResult } from "@/lib/ics";
+import { isBlocking, type BusyRow } from "@/lib/types";
 import { Section } from "./SchedulePanels";
 
 export const IMPORT_DAYS = 30;
 const MAX_FILE_BYTES = 5 * 1024 * 1024;
 
-export type ImportItem = { key: string; title: string; start: number; end: number };
+export type ImportItem = { key: string; title: string; start: number; end: number; blocking: boolean };
 export type ImportOutcome = { inserted: number; existing: number } | { error: string };
 
 type Props = {
@@ -17,13 +17,16 @@ type Props = {
   loadImportedKeys: (from: number) => Promise<Set<string> | null>;
   onImport: (items: ImportItem[]) => Promise<ImportOutcome>;
   onRemoveImported: () => Promise<number | null>;
+  advanced: boolean; // non-blocking events can be saved (migration 002)
+  onMakeInfoOnly: (ids: string[]) => Promise<boolean>;
 };
 
 type Preview = IcsResult & { fileName: string; duplicates: Set<string> };
 
-export default function ImportPanel({ busy, loadImportedKeys, onImport, onRemoveImported }: Props) {
+export default function ImportPanel({ busy, loadImportedKeys, onImport, onRemoveImported, advanced, onMakeInfoOnly }: Props) {
   const [preview, setPreview] = useState<Preview | null>(null);
   const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [blocking, setBlocking] = useState<Set<string>>(new Set());
   const [keepTitles, setKeepTitles] = useState(true);
   const [reading, setReading] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -50,7 +53,9 @@ export default function ImportPanel({ busy, loadImportedKeys, onImport, onRemove
         result.occurrences.filter((o) => keys.has(o.key) || blockedTimes.has(`${o.start}|${o.end}`)).map((o) => o.key),
       );
       setPreview({ ...result, fileName: file.name, duplicates });
-      setSelected(new Set(result.occurrences.filter((o) => defaultOn(o, duplicates)).map((o) => o.key)));
+      const defaults = result.occurrences.map((o) => ({ key: o.key, ...importDefaults(o, duplicates.has(o.key), advanced) }));
+      setSelected(new Set(defaults.filter((d) => d.selected).map((d) => d.key)));
+      setBlocking(new Set(defaults.filter((d) => d.blocking).map((d) => d.key)));
     } catch (error) {
       setErr(error instanceof Error ? error.message : "This file could not be read.");
     } finally {
@@ -58,8 +63,8 @@ export default function ImportPanel({ busy, loadImportedKeys, onImport, onRemove
     }
   }
 
-  function toggle(key: string) {
-    setSelected((prev) => {
+  function toggleIn(setter: typeof setSelected, key: string) {
+    setter((prev) => {
       const next = new Set(prev);
       if (next.has(key)) next.delete(key);
       else next.add(key);
@@ -77,19 +82,39 @@ export default function ImportPanel({ busy, loadImportedKeys, onImport, onRemove
     if (!preview) return;
     const items = preview.occurrences
       .filter((o) => selected.has(o.key))
-      .map((o) => ({ key: o.key, title: keepTitles ? o.title : "Busy", start: o.start, end: o.end }));
+      .map((o) => ({
+        key: o.key,
+        title: keepTitles ? o.title : "Busy",
+        start: o.start,
+        end: o.end,
+        // Without non-blocking support every saved event blocks study time
+        blocking: advanced ? blocking.has(o.key) : true,
+      }));
     if (items.length === 0) return setErr("Select at least one event to import.");
     setErr(null);
     setSaving(true);
     const result = await onImport(items);
     setSaving(false);
     if ("error" in result) return setErr(result.error);
+    const info = advanced ? items.filter((i) => !i.blocking).length : 0;
     setDone(
-      `Imported ${result.inserted} event${result.inserted === 1 ? "" : "s"} as busy time` +
+      `Imported ${result.inserted} event${result.inserted === 1 ? "" : "s"}${info ? ` (${info} for information only)` : ""}` +
         (result.existing ? ` (${result.existing} already existed and ${result.existing === 1 ? "was" : "were"} skipped)` : "") +
         ". Click Replan to move study sessions around them.",
     );
     reset();
+  }
+
+  // All-day events saved before non-blocking support existed still block whole days
+  const blockingAllDay = busy.filter(
+    (b) => isBlocking(b) && Date.parse(b.ends_at) > Date.now() && isAllDay(Date.parse(b.starts_at), Date.parse(b.ends_at)),
+  );
+
+  async function makeAllDayInfoOnly() {
+    setErr(null);
+    if (await onMakeInfoOnly(blockingAllDay.map((b) => b.id))) {
+      setDone(`${blockingAllDay.length} all-day event${blockingAllDay.length === 1 ? " is" : "s are"} now for information only. Click Replan to use that time.`);
+    }
   }
 
   async function removeAll() {
@@ -186,10 +211,20 @@ export default function ImportPanel({ busy, loadImportedKeys, onImport, onRemove
                   {g.items.map((o) => {
                     const dup = preview.duplicates.has(o.key);
                     return (
-                      <label className={`import-row${dup ? " dup" : ""}`} key={o.key}>
-                        <input type="checkbox" className="check" checked={selected.has(o.key)} onChange={() => toggle(o.key)} />
-                        <span className="import-time">{o.allDay ? "All day" : `${formatClock(o.start)}–${formatClock(o.end)}`}</span>
-                        <span className="import-title">{o.title}</span>
+                      <div className={`import-row${dup ? " dup" : ""}`} key={o.key}>
+                        <label className="import-main">
+                          <input type="checkbox" className="check" checked={selected.has(o.key)} onChange={() => toggleIn(setSelected, o.key)} />
+                          <span className="import-time">{o.allDay ? "All day" : `${formatClock(o.start)}–${formatClock(o.end)}`}</span>
+                          <span className="import-title" title={o.title}>
+                            {o.title}
+                          </span>
+                        </label>
+                        {advanced && selected.has(o.key) && (
+                          <label className="mini-check">
+                            <input type="checkbox" checked={blocking.has(o.key)} onChange={() => toggleIn(setBlocking, o.key)} />
+                            Blocks study
+                          </label>
+                        )}
                         <span className="import-tags">
                           {dup && <span className="badge badge-neutral">Already added</span>}
                           {o.recurring && <span className="badge badge-neutral">Repeats</span>}
@@ -200,7 +235,7 @@ export default function ImportPanel({ busy, loadImportedKeys, onImport, onRemove
                             </span>
                           )}
                         </span>
-                      </label>
+                      </div>
                     );
                   })}
                 </div>
@@ -214,10 +249,14 @@ export default function ImportPanel({ busy, loadImportedKeys, onImport, onRemove
                 <input type="checkbox" className="check" checked={keepTitles} onChange={(e) => setKeepTitles(e.target.checked)} />
                 <span>Save event titles (turn off to save them only as &ldquo;Busy&rdquo;)</span>
               </label>
-              <p className="hint">All-day events and events shown as free start unselected, since they rarely block study time.</p>
+              <p className="hint">
+                {advanced
+                  ? "All-day events are imported for information only and never block study time, unless you tick “Blocks study”. Events shown as free start unselected."
+                  : "All-day events and events shown as free start unselected, since they rarely block study time. Run database migration 002 to import all-day events for information only."}
+              </p>
               <div className="import-actions">
                 <button type="button" className="btn btn-primary" onClick={confirm} disabled={saving || selected.size === 0}>
-                  {saving ? "Importing…" : `Import ${selected.size} as busy`}
+                  {saving ? "Importing…" : `Import ${selected.size} event${selected.size === 1 ? "" : "s"}`}
                 </button>
                 <button type="button" className="btn btn-ghost" onClick={reset} disabled={saving}>
                   Cancel
@@ -239,13 +278,20 @@ export default function ImportPanel({ busy, loadImportedKeys, onImport, onRemove
         </p>
       )}
 
+      {advanced && blockingAllDay.length > 0 && (
+        <div className="notice notice-action" style={{ marginTop: 12 }}>
+          <span>
+            {blockingAllDay.length} upcoming all-day event{blockingAllDay.length === 1 ? " blocks" : "s block"} whole days of study time.
+          </span>
+          <button type="button" className="btn btn-secondary btn-sm" onClick={makeAllDayInfoOnly}>
+            Make {blockingAllDay.length === 1 ? "it" : "them"} info only
+          </button>
+        </div>
+      )}
+
       <button type="button" className="btn btn-ghost btn-sm" style={{ marginTop: 12 }} onClick={removeAll}>
         Remove imported events
       </button>
     </Section>
   );
-}
-
-function defaultOn(o: IcsOccurrence, duplicates: Set<string>): boolean {
-  return !o.allDay && !o.free && !duplicates.has(o.key);
 }

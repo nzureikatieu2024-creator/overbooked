@@ -1,8 +1,8 @@
 "use client";
 
 import { useState } from "react";
-import { WEEKDAYS, formatClock, formatDay, localDateTime, todayISO, trimClock } from "@/lib/format";
-import type { AvailabilityRow, BusyRow, Settings } from "@/lib/types";
+import { WEEKDAYS, formatClock, formatDay, isAllDay, localDateTime, todayISO, trimClock } from "@/lib/format";
+import { isBlocking, type AvailabilityRow, type BusyRow, type Settings } from "@/lib/types";
 
 // Weekdays listed Monday first
 const WEEK_ORDER = [1, 2, 3, 4, 5, 6, 0];
@@ -62,12 +62,12 @@ export function AvailabilityPanel({
 
   return (
     <Section
-      title="Weekly availability"
+      title="Preferred study hours"
       summary={rows.length ? `${Math.round((totalMinutes / 60) * 10) / 10}h / week` : "Not set"}
       defaultOpen={rows.length === 0}
     >
       <p className="hint" style={{ marginBottom: 12 }}>
-        When you can study each week. Study blocks are only placed inside these windows.
+        When you like to study each week. Study sessions are only ever placed inside these windows.
       </p>
       {rows.length > 0 ? (
         <div className="rows">
@@ -126,11 +126,13 @@ export function BusyPanel({
   now,
   onAdd,
   onDelete,
+  onSetBlocking,
 }: {
   rows: BusyRow[];
   now: number;
   onAdd: (title: string, start: Date, end: Date, weeks: number) => Promise<void>;
   onDelete: (id: string) => void;
+  onSetBlocking?: (id: string, blocking: boolean) => void; // only after migration 002
 }) {
   const [title, setTitle] = useState("");
   const [date, setDate] = useState(todayISO);
@@ -141,6 +143,7 @@ export function BusyPanel({
   const [err, setErr] = useState<string | null>(null);
 
   const upcoming = rows.filter((r) => Date.parse(r.ends_at) > now);
+  const infoOnly = upcoming.filter((r) => !isBlocking(r)).length;
   const visible = showAll ? upcoming : upcoming.slice(0, 6);
 
   async function submit(e: React.FormEvent) {
@@ -153,21 +156,35 @@ export function BusyPanel({
   }
 
   return (
-    <Section title="Busy events" summary={`${upcoming.length} upcoming`}>
+    <Section title="Busy events" summary={`${upcoming.length} upcoming${infoOnly ? ` · ${infoOnly} info only` : ""}`}>
       <p className="hint" style={{ marginBottom: 12 }}>
-        Classes, work shifts, appointments. Overbooked never schedules study time over them.
+        Classes, work shifts, appointments. Overbooked never schedules study time over events that block study.
+        {onSetBlocking && " Untick “Blocks study” for events that are only for information."}
       </p>
       {upcoming.length > 0 && (
         <div className="rows">
           {visible.map((r) => (
-            <div className="row" key={r.id}>
+            <div className={`row${isBlocking(r) ? "" : " info"}`} key={r.id}>
               <span className="what">
-                <strong>{r.title}</strong> · {formatDay(Date.parse(r.starts_at))}, {formatClock(Date.parse(r.starts_at))}–
-                {formatClock(Date.parse(r.ends_at))}
+                <strong className="clip" title={r.title}>
+                  {r.title}
+                </strong>
+                <span className="hint">
+                  {formatDay(Date.parse(r.starts_at))}, {busyTimeLabel(r)}
+                  {!isBlocking(r) && " · info only"}
+                </span>
               </span>
-              <button type="button" className="btn btn-ghost btn-sm" onClick={() => onDelete(r.id)}>
-                Remove
-              </button>
+              <span className="row-actions">
+                {onSetBlocking && (
+                  <label className="mini-check" title="When ticked, no study time is planned during this event">
+                    <input type="checkbox" checked={isBlocking(r)} onChange={(e) => onSetBlocking(r.id, e.target.checked)} />
+                    Blocks study
+                  </label>
+                )}
+                <button type="button" className="btn btn-ghost btn-sm" onClick={() => onDelete(r.id)} aria-label={`Remove ${r.title}`}>
+                  Remove
+                </button>
+              </span>
             </div>
           ))}
           {upcoming.length > 6 && (
@@ -226,9 +243,16 @@ export function BusyPanel({
   );
 }
 
-export function SettingsPanel({ settings, onSave }: { settings: Settings; onSave: (s: Settings) => Promise<void> }) {
-  const [session, setSession] = useState(String(settings.session_minutes));
-  const [rest, setRest] = useState(String(settings.break_minutes));
+export function SettingsPanel({
+  settings,
+  onSave,
+  advanced,
+}: {
+  settings: Settings;
+  onSave: (s: Settings) => Promise<boolean>;
+  advanced: boolean; // min session and buffer can be saved (database migration 002 has been run)
+}) {
+  const [form, setForm] = useState(() => toForm(settings));
   const [saved, setSaved] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const [synced, setSynced] = useState(settings);
@@ -236,58 +260,70 @@ export function SettingsPanel({ settings, onSave }: { settings: Settings; onSave
   // Pick up settings loaded from the database after first render
   if (synced !== settings) {
     setSynced(settings);
-    setSession(String(settings.session_minutes));
-    setRest(String(settings.break_minutes));
+    setForm(toForm(settings));
   }
+
+  const set = (key: keyof ReturnType<typeof toForm>) => (e: React.ChangeEvent<HTMLInputElement>) =>
+    setForm({ ...form, [key]: e.target.value });
 
   async function submit(e: React.FormEvent) {
     e.preventDefault();
-    const s = Math.round(Number(session));
-    const b = Math.round(Number(rest));
-    if (!(s >= 25 && s <= 240)) return setErr("Session length must be between 25 and 240 minutes.");
-    if (!(b >= 0 && b <= 120)) return setErr("Break must be between 0 and 120 minutes.");
+    const next: Settings = {
+      session_minutes: Math.round(Number(form.max)),
+      min_session_minutes: Math.round(Number(form.min)),
+      break_minutes: Math.round(Number(form.rest)),
+      buffer_minutes: Math.round(Number(form.buffer)),
+    };
+    if (!(next.min_session_minutes >= 15 && next.min_session_minutes <= 120)) return setErr("Minimum session must be 15–120 minutes.");
+    if (!(next.session_minutes >= next.min_session_minutes && next.session_minutes <= 240)) {
+      return setErr(`Maximum session must be between the minimum (${next.min_session_minutes}) and 240 minutes.`);
+    }
+    if (!(next.break_minutes >= 0 && next.break_minutes <= 120)) return setErr("Break must be 0–120 minutes.");
+    if (!(next.buffer_minutes >= 0 && next.buffer_minutes <= 120)) return setErr("Buffer must be 0–120 minutes.");
     setErr(null);
-    await onSave({ session_minutes: s, break_minutes: b });
-    setSaved(true);
-    setTimeout(() => setSaved(false), 2000);
+    if (await onSave(next)) {
+      setSaved(true);
+      setTimeout(() => setSaved(false), 2000);
+    }
   }
 
   return (
-    <Section title="Session settings" summary={`${settings.session_minutes}m / ${settings.break_minutes}m`}>
+    <Section
+      title="Session settings"
+      summary={`${settings.min_session_minutes}–${settings.session_minutes}m · ${settings.buffer_minutes}m buffer`}
+    >
       <form className="settings-form" onSubmit={submit}>
         <div className="field">
-          <label htmlFor="set-session">Max session (min)</label>
-          <input
-            id="set-session"
-            className="input"
-            type="number"
-            min={25}
-            max={240}
-            step={5}
-            value={session}
-            onChange={(e) => setSession(e.target.value)}
-          />
+          <label htmlFor="set-min">Shortest session</label>
+          <input id="set-min" className="input" type="number" min={15} max={120} step={5} value={form.min} onChange={set("min")} disabled={!advanced} />
         </div>
         <div className="field">
-          <label htmlFor="set-break">Break after (min)</label>
-          <input
-            id="set-break"
-            className="input"
-            type="number"
-            min={0}
-            max={120}
-            step={5}
-            value={rest}
-            onChange={(e) => setRest(e.target.value)}
-          />
+          <label htmlFor="set-session">Longest session</label>
+          <input id="set-session" className="input" type="number" min={15} max={240} step={5} value={form.max} onChange={set("max")} />
+        </div>
+        <div className="field">
+          <label htmlFor="set-break">Break after a session</label>
+          <input id="set-break" className="input" type="number" min={0} max={120} step={5} value={form.rest} onChange={set("rest")} />
+        </div>
+        <div className="field">
+          <label htmlFor="set-buffer">Buffer after classes</label>
+          <input id="set-buffer" className="input" type="number" min={0} max={120} step={5} value={form.buffer} onChange={set("buffer")} disabled={!advanced} />
         </div>
         <button type="submit" className="btn btn-secondary">
           {saved ? "Saved" : "Save"}
         </button>
       </form>
       <p className="hint" style={{ marginTop: 10 }}>
-        Sessions are never shorter than 25 minutes unless less work is left. Changes apply on the next Replan.
+        All in minutes. Study sessions are never shorter than the shortest session, except a final one of at least 15
+        minutes to finish a task (marked &ldquo;short&rdquo;). The buffer keeps time free after each busy event to travel
+        or switch. Changes apply on the next Replan.
       </p>
+      {!advanced && (
+        <p className="notice" style={{ marginTop: 10 }}>
+          The defaults (30-minute shortest session, 15-minute buffer) are already used. To change them, run{" "}
+          <code>supabase/migrations/002_planner_preferences.sql</code> in Supabase once.
+        </p>
+      )}
       {err && (
         <p className="error" role="alert" style={{ marginTop: 10 }}>
           {err}
@@ -297,7 +333,27 @@ export function SettingsPanel({ settings, onSave }: { settings: Settings; onSave
   );
 }
 
+function toForm(s: Settings) {
+  return {
+    max: String(s.session_minutes),
+    min: String(s.min_session_minutes),
+    rest: String(s.break_minutes),
+    buffer: String(s.buffer_minutes),
+  };
+}
+
 function clockMinutes(value: string): number {
   const [h, m] = value.split(":").map(Number);
   return h * 60 + m;
+}
+
+/** "09:00–10:30", or "All day" / "All day · 3 days" for events covering whole local days. */
+export function busyTimeLabel(b: BusyRow): string {
+  const start = Date.parse(b.starts_at);
+  const end = Date.parse(b.ends_at);
+  if (isAllDay(start, end)) {
+    const days = Math.round((end - start) / 86_400_000);
+    return days > 1 ? `All day · ${days} days` : "All day";
+  }
+  return `${formatClock(start)}–${formatClock(end)}`;
 }

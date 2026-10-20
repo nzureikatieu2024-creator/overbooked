@@ -2,8 +2,8 @@
 
 import { useState } from "react";
 import { DIFFICULTY, formatDeadline, formatMinutes } from "@/lib/format";
-import { FACTOR_MIN_SAMPLES, deadlineEnd, suggestEstimate, type FactorInfo } from "@/lib/scheduler";
-import type { TaskRow, TaskStats } from "@/lib/types";
+import { FACTOR_MIN_SAMPLES, SHORT_FINAL_MINUTES, deadlineEnd, suggestEstimate, type FactorInfo } from "@/lib/scheduler";
+import { isArchived, type TaskRow, type TaskStats } from "@/lib/types";
 
 export type NewTask = {
   title: string;
@@ -22,16 +22,30 @@ type Props = {
   onAdd: (task: NewTask) => Promise<boolean>;
   onToggle: (task: TaskRow) => void;
   onDelete: (task: TaskRow) => void;
+  onArchive?: (task: TaskRow, archive: boolean) => void; // only after migration 002
+  onArchiveDone?: () => void;
   factor: FactorInfo;
   byDifficulty: Record<number, FactorInfo>;
 };
 
-export default function TaskPanel({ tasks, stats, loaded, onAdd, onToggle, onDelete, factor, byDifficulty }: Props) {
+export default function TaskPanel({
+  tasks,
+  stats,
+  loaded,
+  onAdd,
+  onToggle,
+  onDelete,
+  onArchive,
+  onArchiveDone,
+  factor,
+  byDifficulty,
+}: Props) {
   const [title, setTitle] = useState("");
   const [deadline, setDeadline] = useState("");
   const [hours, setHours] = useState(DEFAULT_HOURS);
   const [difficulty, setDifficulty] = useState(DEFAULT_DIFFICULTY);
   const [saving, setSaving] = useState(false);
+  const [added, setAdded] = useState<string | null>(null);
   const [formError, setFormError] = useState<string | null>(null);
   // The estimate the user typed before accepting a suggestion; null = their own value is in the field
   const [ownHours, setOwnHours] = useState<string | null>(null);
@@ -56,6 +70,8 @@ export default function TaskPanel({ tasks, stats, loaded, onAdd, onToggle, onDel
     const ok = await onAdd({ title: clean, deadline, estimatedHours, difficulty: Number(difficulty) || 2 });
     setSaving(false);
     if (ok) {
+      setAdded(clean);
+      setTimeout(() => setAdded((a) => (a === clean ? null : a)), 3000);
       setTitle("");
       setDeadline("");
       setHours(DEFAULT_HOURS);
@@ -64,7 +80,10 @@ export default function TaskPanel({ tasks, stats, loaded, onAdd, onToggle, onDel
     }
   }
 
-  const sorted = [...tasks].sort((a, b) => {
+  const archived = tasks.filter(isArchived);
+  const current = tasks.filter((t) => !isArchived(t));
+  const doneCount = current.filter((t) => t.status === "done").length;
+  const sorted = [...current].sort((a, b) => {
     if (a.status !== b.status) return a.status === "active" ? -1 : 1;
     const da = a.deadline ? deadlineEnd(a.deadline) : Infinity;
     const db = b.deadline ? deadlineEnd(b.deadline) : Infinity;
@@ -76,7 +95,7 @@ export default function TaskPanel({ tasks, stats, loaded, onAdd, onToggle, onDel
     <section className="card" aria-labelledby="tasks-heading">
       <div className="card-head">
         <h2 id="tasks-heading">Tasks</h2>
-        <span className="sub">{tasks.filter((t) => t.status === "active").length} open</span>
+        <span className="sub">{current.filter((t) => t.status === "active").length} open</span>
       </div>
 
       <form className="task-form" onSubmit={submit}>
@@ -187,6 +206,9 @@ export default function TaskPanel({ tasks, stats, loaded, onAdd, onToggle, onDel
             </p>
           )
         )}
+        <p className="saved" role="status" aria-live="polite">
+          {added ? `Added “${added}”. Click Replan to schedule it.` : ""}
+        </p>
         {formError && (
           <p className="error" role="alert">
             {formError}
@@ -198,7 +220,11 @@ export default function TaskPanel({ tasks, stats, loaded, onAdd, onToggle, onDel
         {!loaded ? (
           <p className="empty">Loading your tasks…</p>
         ) : sorted.length === 0 ? (
-          <p className="empty">No tasks yet. Add your first assignment or exam above.</p>
+          <p className="empty">
+            {archived.length
+              ? "No current tasks. Add an assignment or exam above, or restore one from the archive."
+              : "No tasks yet. Add your first assignment or exam above."}
+          </p>
         ) : (
           <ul className="task-list">
             {sorted.map((task) => (
@@ -208,9 +234,48 @@ export default function TaskPanel({ tasks, stats, loaded, onAdd, onToggle, onDel
                 stats={stats.get(task.id)}
                 onToggle={() => onToggle(task)}
                 onDelete={() => onDelete(task)}
+                onArchive={onArchive ? () => onArchive(task, true) : undefined}
               />
             ))}
           </ul>
+        )}
+
+        {onArchiveDone && doneCount > 1 && (
+          <button type="button" className="btn btn-ghost btn-sm" style={{ marginTop: 10 }} onClick={onArchiveDone}>
+            Archive {doneCount} done tasks
+          </button>
+        )}
+
+        {archived.length > 0 && (
+          <details className="archived">
+            <summary>
+              Archived ({archived.length}) <span className="hint">· hidden and not planned; history kept</span>
+            </summary>
+            <ul className="task-list">
+              {archived.map((task) => (
+                <li className="task-item archived-item" data-testid="core-item" key={task.id}>
+                  <span className="archived-dot" aria-hidden="true" />
+                  <div style={{ minWidth: 0 }}>
+                    <div className="task-title">{task.title}</div>
+                    <div className="task-meta">
+                      <span>{task.deadline ? `Due ${formatDeadline(task.deadline)}` : "No deadline"}</span>
+                      <span>{task.status === "done" ? "Done" : "Not finished"}</span>
+                    </div>
+                  </div>
+                  <div className="task-actions row-actions">
+                    {onArchive && (
+                      <button type="button" className="btn btn-secondary btn-sm" onClick={() => onArchive(task, false)}>
+                        Restore
+                      </button>
+                    )}
+                    <button type="button" className="btn btn-ghost btn-sm" onClick={() => onDelete(task)} aria-label={`Delete “${task.title}”`}>
+                      Delete
+                    </button>
+                  </div>
+                </li>
+              ))}
+            </ul>
+          </details>
         )}
       </div>
     </section>
@@ -222,11 +287,13 @@ function TaskItem({
   stats,
   onToggle,
   onDelete,
+  onArchive,
 }: {
   task: TaskRow;
   stats?: TaskStats;
   onToggle: () => void;
   onDelete: () => void;
+  onArchive?: () => void;
 }) {
   const done = task.status === "done";
   const total = stats ? stats.logged + stats.remaining : 0;
@@ -235,6 +302,12 @@ function TaskItem({
   let badge: React.ReactNode = null;
   if (done) badge = <span className="badge badge-ok">Done</span>;
   else if (stats && stats.remaining === 0) badge = <span className="badge badge-ok">Time covered</span>;
+  else if (stats && stats.remaining < SHORT_FINAL_MINUTES)
+    badge = (
+      <span className="badge badge-neutral" title="Too short for a study session. Finish it in a spare moment, then mark it done.">
+        {formatMinutes(stats.remaining)} left · too short to plan
+      </span>
+    );
   else if (stats && stats.unscheduled > 0 && stats.plannedAhead === 0)
     badge = <span className="badge badge-neutral">Not planned yet</span>;
   else if (stats && stats.unscheduled > 0)
@@ -267,9 +340,16 @@ function TaskItem({
       </div>
       <div className="task-actions">
         {badge}
-        <button type="button" className="btn btn-ghost btn-sm" onClick={onDelete} aria-label={`Delete “${task.title}”`}>
-          Delete
-        </button>
+        <div className="row-actions">
+          {onArchive && (
+            <button type="button" className="btn btn-ghost btn-sm" onClick={onArchive} aria-label={`Archive “${task.title}”`}>
+              Archive
+            </button>
+          )}
+          <button type="button" className="btn btn-ghost btn-sm" onClick={onDelete} aria-label={`Delete “${task.title}”`}>
+            Delete
+          </button>
+        </div>
       </div>
     </li>
   );

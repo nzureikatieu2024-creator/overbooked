@@ -65,6 +65,12 @@ create table if not exists public.planner_settings (
 alter table public.busy_events add column if not exists external_uid text check (char_length(external_uid) <= 1000);
 create unique index if not exists busy_events_user_external_uid_idx on public.busy_events (user_id, external_uid);
 
+-- Study preferences, non-blocking events and archived tasks (also in migrations/002_planner_preferences.sql)
+alter table public.planner_settings add column if not exists min_session_minutes integer not null default 30 check (min_session_minutes between 15 and 120);
+alter table public.planner_settings add column if not exists buffer_minutes integer not null default 15 check (buffer_minutes between 0 and 120);
+alter table public.busy_events add column if not exists blocking boolean not null default true;
+alter table public.tasks add column if not exists archived_at timestamptz;
+
 create index if not exists tasks_user_idx          on public.tasks (user_id);
 create index if not exists availability_user_idx   on public.availability (user_id);
 create index if not exists busy_events_user_idx    on public.busy_events (user_id, starts_at);

@@ -9,6 +9,7 @@ export type TaskRow = {
   difficulty: number;
   status: TaskStatus;
   created_at: string;
+  archived_at?: string | null; // needs migration 002; undefined before it is run
 };
 
 export type AvailabilityRow = {
@@ -23,6 +24,7 @@ export type BusyRow = {
   title: string;
   starts_at: string;
   ends_at: string;
+  blocking?: boolean; // false = informational only; undefined (before migration 002) = blocking
 };
 
 export type SessionRow = {
@@ -35,11 +37,16 @@ export type SessionRow = {
 };
 
 export type Settings = {
-  session_minutes: number;
+  session_minutes: number; // maximum session length
   break_minutes: number;
+  min_session_minutes: number;
+  buffer_minutes: number; // kept free after busy events
 };
 
-export const DEFAULT_SETTINGS: Settings = { session_minutes: 50, break_minutes: 10 };
+export const DEFAULT_SETTINGS: Settings = { session_minutes: 50, break_minutes: 10, min_session_minutes: 30, buffer_minutes: 15 };
+
+export const isBlocking = (b: BusyRow) => b.blocking !== false;
+export const isArchived = (t: TaskRow) => Boolean(t.archived_at);
 
 export type TaskStats = {
   remaining: number; // minutes still needed (estimate × factor − logged)

@@ -7,15 +7,17 @@ import {
   difficultyFactors,
   planSchedule,
   remainingMinutes,
-  type Interval,
-  type PlannerTask,
-  type SessionRecord,
   type SessionStatus,
   type Shortfall,
 } from "@/lib/scheduler";
+import { buildPlanInput, toRecord, toTask, type PlanData } from "@/lib/plan-input";
+import { assessRisks } from "@/lib/risk";
+import { changeInterval, estimateWithExtra, type Change } from "@/lib/whatif";
 import { formatDeadline, formatMinutes } from "@/lib/format";
 import {
   DEFAULT_SETTINGS,
+  isArchived,
+  isBlocking,
   type AvailabilityRow,
   type BusyRow,
   type SessionRow,
@@ -29,6 +31,8 @@ import WeekCalendar from "./WeekCalendar";
 import Insights from "./Insights";
 import ImportPanel, { type ImportItem, type ImportOutcome } from "./ImportPanel";
 import Today from "./Today";
+import RiskPanel from "./RiskPanel";
+import WhatIfPanel from "./WhatIfPanel";
 
 type PlanSummary = {
   sessions: number;
@@ -36,24 +40,6 @@ type PlanSummary = {
   markedMissed: number;
   shortfalls: (Shortfall & { title: string; deadline: string | null })[];
 };
-
-const toTask = (t: TaskRow): PlannerTask => ({
-  id: t.id,
-  title: t.title,
-  deadline: t.deadline,
-  estimatedHours: Number(t.estimated_hours),
-  difficulty: t.difficulty,
-  status: t.status,
-  createdAt: t.created_at,
-});
-
-const toRecord = (s: SessionRow): SessionRecord => ({
-  taskId: s.task_id,
-  start: Date.parse(s.starts_at),
-  end: Date.parse(s.ends_at),
-  status: s.status,
-  actualMinutes: s.actual_minutes,
-});
 
 export default function Planner() {
   const supabase = useMemo(() => createClient(), []);
@@ -63,6 +49,9 @@ export default function Planner() {
   const [sessions, setSessions] = useState<SessionRow[]>([]);
   const [settings, setSettings] = useState<Settings>(DEFAULT_SETTINGS);
   const [loaded, setLoaded] = useState(false);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  // true once database migration 002 is present (non-blocking events, archive, min session, buffer)
+  const [advanced, setAdvanced] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [planning, setPlanning] = useState(false);
   const [summary, setSummary] = useState<PlanSummary | null>(null);
@@ -83,9 +72,9 @@ export default function Planner() {
     setSessions((data ?? []) as SessionRow[]);
   }, [supabase]);
 
-  useEffect(() => {
-    (async () => {
-      try {
+  const loadAll = useCallback(async () => {
+    setLoadError(null);
+    try {
         const since = new Date(Date.now() - 60 * 24 * 3600_000).toISOString();
         const [t, a, b, s] = await Promise.all([
           supabase
@@ -97,21 +86,38 @@ export default function Planner() {
           supabase.from("planner_settings").select("session_minutes, break_minutes").maybeSingle(),
         ]);
         for (const r of [t, a, b, s]) if (r.error) throw r.error;
-        setTasks((t.data ?? []) as TaskRow[]);
+
+        // Columns added by migration 002 are read separately, so the app keeps working before it is run
+        const [ta, bb, se] = await Promise.all([
+          supabase.from("tasks").select("id, archived_at").not("archived_at", "is", null),
+          supabase.from("busy_events").select("id").eq("blocking", false).gte("ends_at", since),
+          supabase.from("planner_settings").select("min_session_minutes, buffer_minutes").maybeSingle(),
+        ]);
+        const hasV2 = !ta.error && !bb.error && !se.error;
+        const archived = new Map(hasV2 ? (ta.data ?? []).map((r) => [r.id as string, r.archived_at as string]) : []);
+        const infoOnly = new Set(hasV2 ? (bb.data ?? []).map((r) => r.id as string) : []);
+
+        setAdvanced(hasV2);
+        setTasks(((t.data ?? []) as TaskRow[]).map((row) => ({ ...row, archived_at: archived.get(row.id) ?? null })));
         setAvailability((a.data ?? []) as AvailabilityRow[]);
-        setBusy((b.data ?? []) as BusyRow[]);
-        if (s.data) setSettings(s.data as Settings);
+        setBusy(((b.data ?? []) as BusyRow[]).map((row) => ({ ...row, blocking: !infoOnly.has(row.id) })));
+        setSettings({ ...DEFAULT_SETTINGS, ...(s.data ?? {}), ...(hasV2 && se.data ? se.data : {}) } as Settings);
         await loadSessions();
-      } catch (e) {
-        setError(messageOf(e));
-      } finally {
         setLoaded(true);
+      } catch (e) {
+        // Never show empty lists as if there were no data: keep a clear error with a retry
+        setLoadError(messageOf(e));
       }
-    })();
   }, [supabase, loadSessions]);
+
+  useEffect(() => {
+    loadAll();
+  }, [loadAll]);
 
   // ── Derived numbers ─────────────────────────────
 
+  // Archived tasks keep their history but are hidden from planning, Today, risk and What-if
+  const activeTasks = useMemo(() => tasks.filter((t) => !isArchived(t)), [tasks]);
   const records = useMemo(() => sessions.map(toRecord), [sessions]);
   const factorInfo = useMemo(() => adjustmentFactor(records), [records]);
   const byDifficulty = useMemo(() => {
@@ -149,8 +155,25 @@ export default function Planner() {
   const conflictCount = upcoming.filter((s) => {
     const start = Date.parse(s.starts_at);
     const end = Date.parse(s.ends_at);
-    return busy.some((b) => Date.parse(b.starts_at) < end && start < Date.parse(b.ends_at));
+    return busy.some((b) => isBlocking(b) && Date.parse(b.starts_at) < end && start < Date.parse(b.ends_at));
   }).length;
+
+  const planData = useMemo<PlanData>(
+    () => ({ tasks: activeTasks, availability, busy, sessions, settings }),
+    [activeTasks, availability, busy, sessions, settings],
+  );
+
+  // Deadline risk: the plan Replan would make right now, compared with real free time
+  const riskReport = useMemo(() => {
+    if (!loaded) return null;
+    try {
+      const { input } = buildPlanInput(planData, new Date(now));
+      const saved = new Map([...stats].map(([id, s]) => [id, s.unscheduled]));
+      return assessRisks(input, planSchedule(input), saved);
+    } catch {
+      return null;
+    }
+  }, [loaded, planData, stats, now]);
 
   // ── Tasks ───────────────────────────────────────
 
@@ -193,8 +216,59 @@ export default function Planner() {
     }
   }
 
+  /** Removes a task's future planned sessions (never completed or missed ones). */
+  async function dropUpcoming(taskId: string | null): Promise<boolean> {
+    const ids = sessions
+      .filter((s) => (taskId === null || s.task_id === taskId) && s.status === "planned" && Date.parse(s.starts_at) > Date.now())
+      .map((s) => s.id);
+    if (!ids.length) return true;
+    const { error } = await supabase.from("study_sessions").delete().in("id", ids);
+    if (error) {
+      setError(error.message);
+      return false;
+    }
+    setSessions((prev) => prev.filter((s) => !ids.includes(s.id)));
+    return true;
+  }
+
+  async function archiveTask(task: TaskRow, archive: boolean) {
+    setError(null);
+    const archived_at = archive ? new Date().toISOString() : null;
+    const { error } = await supabase.from("tasks").update({ archived_at }).eq("id", task.id);
+    if (error) return setError(error.message);
+    setTasks((prev) => prev.map((t) => (t.id === task.id ? { ...t, archived_at } : t)));
+    // Archived work no longer needs future study blocks; its completed history stays
+    if (archive) await dropUpcoming(task.id);
+  }
+
+  async function archiveDone() {
+    const done = activeTasks.filter((t) => t.status === "done");
+    if (!done.length) return;
+    if (!window.confirm(`Archive ${done.length} completed task${done.length === 1 ? "" : "s"}? Their study history is kept and you can restore them any time.`)) return;
+    setError(null);
+    const archived_at = new Date().toISOString();
+    const ids = done.map((t) => t.id);
+    const { error } = await supabase.from("tasks").update({ archived_at }).in("id", ids);
+    if (error) return setError(error.message);
+    setTasks((prev) => prev.map((t) => (ids.includes(t.id) ? { ...t, archived_at } : t)));
+  }
+
+  async function clearUpcomingPlan() {
+    const count = upcoming.length;
+    if (!count) return;
+    if (!window.confirm(`Remove ${count} upcoming planned session${count === 1 ? "" : "s"}? Tasks, completed and missed sessions are kept. Click Auto-Plan afterwards to build a fresh plan.`)) return;
+    setError(null);
+    setSummary(null);
+    await dropUpcoming(null);
+  }
+
   async function deleteTask(task: TaskRow) {
-    if (!window.confirm(`Delete “${task.title}” and its study sessions?`)) return;
+    const history = sessions.filter((s) => s.task_id === task.id && s.status !== "planned");
+    const logged = history.filter((s) => s.status === "completed").reduce((sum, s) => sum + (s.actual_minutes ?? minutesOf(s)), 0);
+    const warning = history.length
+      ? `\n\nThis also permanently deletes ${history.length} past session${history.length === 1 ? "" : "s"}${logged ? ` (${formatMinutes(logged)} of logged study time)` : ""}, which your time factor is based on.${advanced ? " Choose Archive instead to keep them." : ""}`
+      : "";
+    if (!window.confirm(`Permanently delete “${task.title}”?${warning}`)) return;
     setError(null);
     const { error } = await supabase.from("tasks").delete().eq("id", task.id);
     if (error) return setError(error.message);
@@ -216,57 +290,32 @@ export default function Planner() {
 
   // ── Auto-Plan / Replan ──────────────────────────
 
-  async function runPlan() {
+  // `override` lets Apply scenario plan with rows it has just saved, before React state updates.
+  async function runPlan(override: Partial<PlanData> = {}): Promise<boolean> {
+    const data: PlanData = { tasks: activeTasks, availability, busy, sessions, settings, ...override };
     setError(null);
     setSummary(null);
-    if (availability.length === 0) {
+    if (data.availability.length === 0) {
       setError("Add your weekly study availability first, so Overbooked knows when you can study.");
-      return;
+      return false;
     }
-    if (!tasks.some((t) => t.status === "active")) {
+    if (!data.tasks.some((t) => t.status === "active")) {
       setError("Add at least one open task to plan.");
-      return;
+      return false;
     }
 
     setPlanning(true);
     try {
-      const at = new Date();
-      const nowMs = at.getTime();
+      const { input, overdueIds, replaceIds } = buildPlanInput(data, new Date());
 
       // 1. Past planned sessions that were never marked count as missed.
-      const overdueIds = sessions
-        .filter((s) => s.status === "planned" && Date.parse(s.ends_at) <= nowMs)
-        .map((s) => s.id);
       if (overdueIds.length) {
         const { error } = await supabase.from("study_sessions").update({ status: "missed" }).in("id", overdueIds);
         if (error) throw error;
       }
 
       // 2. Completed and missed sessions are kept; upcoming planned ones are rebuilt.
-      const replaceIds = sessions
-        .filter((s) => s.status === "planned" && Date.parse(s.ends_at) > nowMs)
-        .map((s) => s.id);
-      const kept = sessions.filter((s) => !replaceIds.includes(s.id));
-
-      const blocked: Interval[] = [
-        ...busy.map((b) => ({ start: Date.parse(b.starts_at), end: Date.parse(b.ends_at) })),
-        ...kept.map((s) => ({ start: Date.parse(s.starts_at), end: Date.parse(s.ends_at) })),
-      ].filter((i) => i.end > nowMs);
-
-      const result = planSchedule({
-        now: at,
-        tasks: tasks.map(toTask),
-        availability: availability.map((a) => ({
-          weekday: a.weekday,
-          startTime: a.start_time,
-          endTime: a.end_time,
-        })),
-        blocked,
-        sessions: kept.map(toRecord),
-        sessionMinutes: settings.session_minutes,
-        breakMinutes: settings.break_minutes,
-        factor: factorInfo.factor,
-      });
+      const result = planSchedule(input);
 
       // 3. Persist: remove the old upcoming plan, then save the new one.
       if (replaceIds.length) {
@@ -287,7 +336,7 @@ export default function Planner() {
       await loadSessions();
       setNow(Date.now());
 
-      const byId = new Map(tasks.map((t) => [t.id, t]));
+      const byId = new Map(data.tasks.map((t) => [t.id, t]));
       setSummary({
         sessions: result.blocks.length,
         minutes: result.scheduledMinutes,
@@ -298,12 +347,58 @@ export default function Planner() {
           deadline: byId.get(s.taskId)?.deadline ?? null,
         })),
       });
+      return true;
     } catch (e) {
       setError(messageOf(e));
       await loadSessions().catch(() => undefined);
+      return false;
     } finally {
       setPlanning(false);
     }
+  }
+
+  // ── What-if: only runs when the user explicitly applies a scenario ──
+
+  async function applyScenario(changes: Change[]): Promise<boolean> {
+    setError(null);
+    let nextTasks = tasks;
+    let nextBusy = busy;
+
+    const lost = changes.filter((c): c is Extract<Change, { kind: "lose_time" }> => c.kind === "lose_time");
+    if (lost.length) {
+      const { data, error } = await supabase
+        .from("busy_events")
+        .insert(
+          lost.map((c) => {
+            const i = changeInterval(c);
+            return { title: "Unavailable (what-if)", starts_at: new Date(i.start).toISOString(), ends_at: new Date(i.end).toISOString() };
+          }),
+        )
+        .select("id, title, starts_at, ends_at");
+      if (error) {
+        setError(error.message);
+        return false;
+      }
+      nextBusy = [...busy, ...((data ?? []) as BusyRow[])].sort((a, b) => a.starts_at.localeCompare(b.starts_at));
+      setBusy(nextBusy);
+    }
+
+    const extra = new Map<string, number>();
+    for (const c of changes) if (c.kind === "extra_work") extra.set(c.taskId, (extra.get(c.taskId) ?? 0) + c.hours);
+    for (const [taskId, hours] of extra) {
+      const task = nextTasks.find((t) => t.id === taskId);
+      if (!task) continue;
+      const estimated_hours = Math.min(200, estimateWithExtra(Number(task.estimated_hours), hours, factorInfo.factor));
+      const { error } = await supabase.from("tasks").update({ estimated_hours }).eq("id", taskId);
+      if (error) {
+        setError(error.message);
+        return false;
+      }
+      nextTasks = nextTasks.map((t) => (t.id === taskId ? { ...t, estimated_hours } : t));
+    }
+    setTasks(nextTasks);
+
+    return runPlan({ tasks: nextTasks, busy: nextBusy });
   }
 
   // ── Availability, busy events, settings ─────────
@@ -392,15 +487,17 @@ export default function Planner() {
             starts_at: new Date(it.start).toISOString(),
             ends_at: new Date(it.end).toISOString(),
             external_uid: it.key,
+            ...(advanced ? { blocking: it.blocking } : {}),
           })),
           { onConflict: "user_id,external_uid", ignoreDuplicates: true },
         )
-        .select("id, title, starts_at, ends_at");
+        .select(advanced ? "id, title, starts_at, ends_at, blocking" : "id, title, starts_at, ends_at");
       if (error) {
         if (inserted.length) addBusyRows(inserted);
         return { error: importErrorMessage(error.message) };
       }
-      inserted.push(...((data ?? []) as BusyRow[]));
+      // The column list is chosen at runtime, so the typed parser can't infer the row shape
+      inserted.push(...((data ?? []) as unknown as BusyRow[]));
     }
     addBusyRows(inserted);
     return { inserted: inserted.length, existing: items.length - inserted.length };
@@ -423,19 +520,49 @@ export default function Planner() {
     return ids.size;
   }
 
+  async function setManyNonBlocking(ids: string[]): Promise<boolean> {
+    setError(null);
+    const { error } = await supabase.from("busy_events").update({ blocking: false }).in("id", ids);
+    if (error) {
+      setError(error.message);
+      return false;
+    }
+    setBusy((prev) => prev.map((b) => (ids.includes(b.id) ? { ...b, blocking: false } : b)));
+    return true;
+  }
+
   function addBusyRows(rows: BusyRow[]) {
     setBusy((prev) => [...prev, ...rows].sort((a, b) => a.starts_at.localeCompare(b.starts_at)));
   }
 
-  async function saveSettings(next: Settings) {
+  async function saveSettings(next: Settings): Promise<boolean> {
     setError(null);
     const { data: auth } = await supabase.auth.getUser();
-    if (!auth.user) return setError("Your session expired. Please log in again.");
-    const { error } = await supabase
-      .from("planner_settings")
-      .upsert({ user_id: auth.user.id, ...next, updated_at: new Date().toISOString() });
+    if (!auth.user) {
+      setError("Your session expired. Please log in again.");
+      return false;
+    }
+    const row: Record<string, unknown> = {
+      user_id: auth.user.id,
+      session_minutes: next.session_minutes,
+      break_minutes: next.break_minutes,
+      updated_at: new Date().toISOString(),
+    };
+    if (advanced) Object.assign(row, { min_session_minutes: next.min_session_minutes, buffer_minutes: next.buffer_minutes });
+    const { error } = await supabase.from("planner_settings").upsert(row);
+    if (error) {
+      setError(error.message);
+      return false;
+    }
+    setSettings(advanced ? next : { ...next, min_session_minutes: settings.min_session_minutes, buffer_minutes: settings.buffer_minutes });
+    return true;
+  }
+
+  async function setBusyBlocking(id: string, blocking: boolean) {
+    setError(null);
+    const { error } = await supabase.from("busy_events").update({ blocking }).eq("id", id);
     if (error) return setError(error.message);
-    setSettings(next);
+    setBusy((prev) => prev.map((b) => (b.id === id ? { ...b, blocking } : b)));
   }
 
   // ── Render ──────────────────────────────────────
@@ -449,10 +576,26 @@ export default function Planner() {
         </div>
       </div>
 
+      {loadError && (
+        <div className="error-card" role="alert">
+          <div>
+            <strong>Your plan couldn&apos;t be loaded.</strong>
+            <p>{loadError}</p>
+            <p className="hint">Your data is safe and nothing was changed. Check your connection and try again.</p>
+          </div>
+          <button type="button" className="btn btn-secondary" onClick={loadAll}>
+            Try again
+          </button>
+        </div>
+      )}
+
       {error && (
-        <p className="error" role="alert">
-          {error}
-        </p>
+        <div className="error error-banner" role="alert">
+          <span>{error}</span>
+          <button type="button" className="btn btn-ghost btn-sm" onClick={() => setError(null)} aria-label="Dismiss message">
+            Dismiss
+          </button>
+        </div>
       )}
 
       {loaded ? (
@@ -469,6 +612,8 @@ export default function Planner() {
           onAdd={addTask}
           onToggle={toggleTask}
           onDelete={deleteTask}
+          onArchive={advanced ? archiveTask : undefined}
+          onArchiveDone={advanced ? archiveDone : undefined}
           factor={factorInfo}
           byDifficulty={byDifficulty}
         />
@@ -498,10 +643,20 @@ export default function Planner() {
                   <div className="k">time factor</div>
                 </div>
               </div>
-              <button type="button" className="btn btn-primary" onClick={runPlan} disabled={planning || !loaded}>
+              <button type="button" className="btn btn-primary" onClick={() => runPlan()} disabled={planning || !loaded}>
                 {planning ? "Planning…" : hasPlan ? "Replan" : "Auto-Plan"}
               </button>
             </div>
+            {upcoming.length > 0 && (
+              <div className="plan-tools">
+                <span className="hint">
+                  Replan rebuilds upcoming sessions and keeps completed and missed ones.
+                </span>
+                <button type="button" className="btn btn-ghost btn-sm" onClick={clearUpcomingPlan} disabled={planning}>
+                  Clear upcoming plan
+                </button>
+              </div>
+            )}
 
             {conflictCount > 0 && (
               <p className="notice" style={{ marginTop: 14 }}>
@@ -525,11 +680,20 @@ export default function Planner() {
                   {summary.markedMissed > 0 &&
                     ` ${summary.markedMissed} past unmarked session${summary.markedMissed === 1 ? " was" : "s were"} counted as missed.`}
                 </p>
-                {summary.shortfalls.length > 0 ? (
+                {summary.shortfalls.some((s) => s.reason === "below_minimum") && (
+                  <p className="hint">
+                    {summary.shortfalls
+                      .filter((s) => s.reason === "below_minimum")
+                      .map((s) => `${s.title}: ${formatMinutes(s.minutes)} left`)
+                      .join(" · ")}{" "}
+                    — too short for a study session, so not scheduled. Finish it in a spare moment and mark it done.
+                  </p>
+                )}
+                {summary.shortfalls.some((s) => s.reason !== "below_minimum") ? (
                   <div className="error">
                     <strong>This work cannot fit in your available time:</strong>
                     <ul>
-                      {summary.shortfalls.map((s) => (
+                      {summary.shortfalls.filter((s) => s.reason !== "below_minimum").map((s) => (
                         <li key={s.taskId}>
                           {s.title}: {formatMinutes(s.minutes)}{" "}
                           {s.reason === "deadline_passed"
@@ -551,22 +715,41 @@ export default function Planner() {
             )}
           </section>
 
+          {riskReport && <RiskPanel report={riskReport} sessionMinutes={settings.session_minutes} hasPlan={hasPlan} />}
+
           <AvailabilityPanel
             rows={availability}
             onAdd={addAvailability}
             onPreset={addAvailabilityPreset}
             onDelete={deleteAvailability}
           />
-          <BusyPanel rows={busy} now={now} onAdd={addBusy} onDelete={deleteBusy} />
+          <BusyPanel
+            rows={busy}
+            now={now}
+            onAdd={addBusy}
+            onDelete={deleteBusy}
+            onSetBlocking={advanced ? setBusyBlocking : undefined}
+          />
           <ImportPanel
             busy={busy}
             loadImportedKeys={loadImportedKeys}
             onImport={importBusy}
             onRemoveImported={removeImported}
+            advanced={advanced}
+            onMakeInfoOnly={setManyNonBlocking}
           />
-          <SettingsPanel settings={settings} onSave={saveSettings} />
+          <SettingsPanel settings={settings} onSave={saveSettings} advanced={advanced} />
         </div>
       </div>
+
+      {loaded && (
+        <WhatIfPanel
+          data={planData}
+          now={now}
+          planning={planning}
+          onApply={applyScenario}
+        />
+      )}
 
       {loaded && (
         <WeekCalendar
@@ -574,11 +757,14 @@ export default function Planner() {
           sessions={sessions}
           busy={busy}
           tasks={tasks}
+          availability={availability}
+          minSessionMinutes={settings.min_session_minutes}
           onUpdate={updateSession}
+          onSetBlocking={advanced ? setBusyBlocking : undefined}
         />
       )}
 
-      {loaded && <Insights tasks={tasks} stats={stats} factor={factorInfo} byDifficulty={byDifficulty} />}
+      {loaded && <Insights tasks={activeTasks} stats={stats} factor={factorInfo} byDifficulty={byDifficulty} />}
     </div>
   );
 }

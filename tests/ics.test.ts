@@ -201,3 +201,27 @@ test("events outside the window are left out", () => {
   assert.equal(r.eventCount, 2);
   assert.equal(r.occurrences.length, 0);
 });
+
+// ── Regression: all-day informational events must not block study time by default ──
+
+import { importDefaults } from "../lib/ics.ts";
+
+test("all-day events are imported as non-blocking by default; timed events block", () => {
+  assert.deepEqual(importDefaults({ allDay: true, free: false }, false, true), { selected: true, blocking: false });
+  assert.deepEqual(importDefaults({ allDay: false, free: false }, false, true), { selected: true, blocking: true });
+  // "Show as free" and duplicates start unselected
+  assert.deepEqual(importDefaults({ allDay: false, free: true }, false, true), { selected: false, blocking: false });
+  assert.equal(importDefaults({ allDay: false, free: false }, true, true).selected, false);
+  // Before the database can store non-blocking events, all-day events are not pre-selected at all
+  assert.deepEqual(importDefaults({ allDay: true, free: false }, false, false), { selected: false, blocking: false });
+});
+
+test("recurring all-day events keep their dates when imported", () => {
+  const r = parseIcs(
+    cal(event(["UID:wk", "SUMMARY:Week 6 (async module)", "DTSTART;VALUE=DATE:20250303", "DTEND;VALUE=DATE:20250304", "RRULE:FREQ=WEEKLY;COUNT=3"])),
+    from,
+    to,
+  );
+  assert.deepEqual(r.occurrences.map((o) => o.start), [3, 10, 17].map((d) => new Date(2025, 2, d).getTime()));
+  assert.ok(r.occurrences.every((o) => o.allDay && importDefaults(o, false, true).blocking === false));
+});

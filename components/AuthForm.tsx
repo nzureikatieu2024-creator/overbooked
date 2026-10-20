@@ -2,6 +2,7 @@
 
 import Link from "next/link";
 import { useState } from "react";
+import { friendlyAuthError } from "@/lib/auth-recovery";
 import { createClient } from "@/lib/supabase/client";
 
 type Mode = "signup" | "login";
@@ -12,6 +13,7 @@ export default function AuthForm({ mode }: { mode: Mode }) {
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [showPassword, setShowPassword] = useState(false);
   const isSignup = mode === "signup";
 
   async function onSubmit(e: React.FormEvent) {
@@ -21,26 +23,32 @@ export default function AuthForm({ mode }: { mode: Mode }) {
     setBusy(true);
     const supabase = createClient();
 
-    if (isSignup) {
-      const { data, error } = await supabase.auth.signUp({ email, password });
-      if (error) {
-        setError(error.message);
-        setBusy(false);
-        return;
+    try {
+      if (isSignup) {
+        const { data, error } = await supabase.auth.signUp({ email, password });
+        if (error) {
+          setError(friendlyAuthError(error.message, error.status));
+          setBusy(false);
+          return;
+        }
+        if (!data.session) {
+          // Happens only if "Confirm email" is still enabled in Supabase.
+          setNotice("Account created, but email confirmation is turned on in Supabase. Turn it off to log in instantly.");
+          setBusy(false);
+          return;
+        }
+      } else {
+        const { error } = await supabase.auth.signInWithPassword({ email, password });
+        if (error) {
+          setError(friendlyAuthError(error.message, error.status));
+          setBusy(false);
+          return;
+        }
       }
-      if (!data.session) {
-        // Happens only if "Confirm email" is still enabled in Supabase.
-        setNotice("Account created, but email confirmation is turned on in Supabase. Turn it off to log in instantly.");
-        setBusy(false);
-        return;
-      }
-    } else {
-      const { error } = await supabase.auth.signInWithPassword({ email, password });
-      if (error) {
-        setError(error.message);
-        setBusy(false);
-        return;
-      }
+    } catch (e) {
+      setError(friendlyAuthError(e instanceof Error ? e.message : "Network error"));
+      setBusy(false);
+      return;
     }
 
     // Full navigation so the server sees the new session cookie.
@@ -72,18 +80,36 @@ export default function AuthForm({ mode }: { mode: Mode }) {
         </div>
 
         <div className="field">
-          <label htmlFor="password">Password</label>
-          <input
-            id="password"
-            className="input"
-            type="password"
-            autoComplete={isSignup ? "new-password" : "current-password"}
-            required
-            minLength={6}
-            value={password}
-            onChange={(e) => setPassword(e.target.value)}
-            data-testid={isSignup ? "signup-password" : "login-password"}
-          />
+          <div className="label-row">
+            <label htmlFor="password">Password</label>
+            {!isSignup && (
+              <Link href="/forgot-password" className="text-link">
+                Forgot password?
+              </Link>
+            )}
+          </div>
+          <div className="password-wrap">
+            <input
+              id="password"
+              className="input"
+              type={showPassword ? "text" : "password"}
+              autoComplete={isSignup ? "new-password" : "current-password"}
+              required
+              minLength={6}
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              data-testid={isSignup ? "signup-password" : "login-password"}
+            />
+            <button
+              type="button"
+              className="reveal"
+              onClick={() => setShowPassword(!showPassword)}
+              aria-label={showPassword ? "Hide password" : "Show password"}
+              aria-pressed={showPassword}
+            >
+              {showPassword ? "Hide" : "Show"}
+            </button>
+          </div>
           {isSignup && <span className="hint">At least 6 characters.</span>}
         </div>
 
@@ -104,7 +130,7 @@ export default function AuthForm({ mode }: { mode: Mode }) {
           disabled={busy}
           data-testid={isSignup ? "signup-submit" : "login-submit"}
         >
-          {busy ? "Please wait…" : isSignup ? "Sign up" : "Log in"}
+          {busy ? (isSignup ? "Creating account…" : "Logging in…") : isSignup ? "Sign up" : "Log in"}
         </button>
 
         <p className="switch">

@@ -1,4 +1,4 @@
-import { formatClock, formatDeadline, formatMinutes, sameDay, todayISO } from "@/lib/format";
+import { formatClock, formatDeadline, formatMinutes, isAllDay, sameDay, todayISO } from "@/lib/format";
 import type { BusyRow, SessionRow, TaskRow, TaskStats } from "@/lib/types";
 
 type Props = {
@@ -11,7 +11,7 @@ type Props = {
 
 type Item =
   | { kind: "session"; start: number; end: number; title: string; session: SessionRow }
-  | { kind: "busy"; start: number; end: number; title: string; id: string };
+  | { kind: "busy"; start: number; end: number; title: string; id: string; blocking: boolean };
 
 const DAY = 24 * 3600_000;
 
@@ -31,7 +31,14 @@ export default function Today({ now, sessions, busy, tasks, stats }: Props) {
       })),
     ...busy
       .filter((b) => sameDay(Date.parse(b.starts_at), today) || (Date.parse(b.starts_at) < now && Date.parse(b.ends_at) > now))
-      .map((b) => ({ kind: "busy" as const, start: Date.parse(b.starts_at), end: Date.parse(b.ends_at), title: b.title, id: b.id })),
+      .map((b) => ({
+        kind: "busy" as const,
+        start: Date.parse(b.starts_at),
+        end: Date.parse(b.ends_at),
+        title: b.title,
+        id: b.id,
+        blocking: b.blocking !== false,
+      })),
   ].sort((a, b) => a.start - b.start);
 
   const studyToday = items.filter((i): i is Extract<Item, { kind: "session" }> => i.kind === "session");
@@ -45,12 +52,12 @@ export default function Today({ now, sessions, busy, tasks, stats }: Props) {
 
   const iso = todayISO();
   const deadlines = tasks
-    .filter((t) => t.status === "active" && t.deadline)
+    .filter((t) => t.status === "active" && t.deadline && !t.archived_at)
     .sort((a, b) => a.deadline!.localeCompare(b.deadline!))
     .filter((t) => t.deadline! >= iso || (stats.get(t.id)?.remaining ?? 0) > 0)
     .slice(0, 4);
 
-  const hasTasks = tasks.some((t) => t.status === "active");
+  const hasTasks = tasks.some((t) => t.status === "active" && !t.archived_at);
   const hasPlan = sessions.length > 0;
 
   return (
@@ -93,18 +100,24 @@ export default function Today({ now, sessions, busy, tasks, stats }: Props) {
                 const live = i.start <= now && i.end > now;
                 const past = i.end <= now;
                 let state = "";
-                if (i.kind === "busy") state = "Busy";
+                if (i.kind === "busy") state = i.blocking ? "Busy" : "Info";
                 else if (i.session.status === "completed") state = "Done";
                 else if (i.session.status === "missed") state = "Missed";
                 else if (live) state = "Now";
                 else if (past) state = "To mark";
                 else state = formatMinutes((i.end - i.start) / 60_000);
-                const cls = i.kind === "busy" ? "busy" : i.session.status;
+                const cls = i.kind === "busy" ? (i.blocking ? "busy" : "busy info") : i.session.status;
                 return (
                   <li key={i.kind === "busy" ? i.id : i.session.id} className={`tl-item ${cls}${live ? " live" : ""}${past ? " past" : ""}`}>
                     <span className="tl-time">
-                      {formatClock(i.start)}
-                      <span className="tl-end">{formatClock(i.end)}</span>
+                      {i.kind === "busy" && isAllDay(i.start, i.end) ? (
+                        "All day"
+                      ) : (
+                        <>
+                          {formatClock(i.start)}
+                          <span className="tl-end">{formatClock(i.end)}</span>
+                        </>
+                      )}
                     </span>
                     <span className="tl-dot" aria-hidden="true" />
                     <span className="tl-title">{i.title}</span>

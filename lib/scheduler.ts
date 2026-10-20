@@ -22,7 +22,8 @@ export type AvailabilityWindow = {
   endTime: string;
 };
 
-export type Interval = { start: number; end: number };
+// kind "session" = a kept study session; anything else is a busy event, which gets a transition buffer after it
+export type Interval = { start: number; end: number; kind?: "busy" | "session" };
 
 export type SessionRecord = {
   taskId: string;
@@ -32,12 +33,18 @@ export type SessionRecord = {
   actualMinutes: number | null;
 };
 
-export type PlannedBlock = { taskId: string; start: number; end: number };
+export type PlannedBlock = {
+  taskId: string;
+  start: number;
+  end: number;
+  short?: boolean; // final session shorter than the minimum, because less work was left
+};
 
 export type Shortfall = {
   taskId: string;
   minutes: number;
-  reason: "deadline_passed" | "not_enough_time";
+  // below_minimum: the leftover is too small to be a useful session (under SHORT_FINAL_MINUTES)
+  reason: "deadline_passed" | "not_enough_time" | "below_minimum";
 };
 
 export type PlanInput = {
@@ -46,9 +53,11 @@ export type PlanInput = {
   availability: AvailabilityWindow[];
   blocked: Interval[]; // busy events and sessions that must be kept
   sessions: SessionRecord[]; // history, used for remaining work
-  sessionMinutes: number;
+  sessionMinutes: number; // maximum session length
   breakMinutes: number;
   factor: number;
+  minSessionMinutes?: number; // default DEFAULT_MIN_SESSION_MINUTES
+  bufferMinutes?: number; // free time kept after each busy event, default DEFAULT_BUFFER_MINUTES
 };
 
 export type PlanResult = {
@@ -59,7 +68,10 @@ export type PlanResult = {
 
 const MINUTE = 60_000;
 const DAY = 24 * 60 * MINUTE;
-export const MIN_SESSION_MINUTES = 25;
+export const DEFAULT_MIN_SESSION_MINUTES = 30;
+export const DEFAULT_BUFFER_MINUTES = 15;
+// A last session may be shorter than the minimum (e.g. 20 min to finish a task), but never under this
+export const SHORT_FINAL_MINUTES = 15;
 export const NO_DEADLINE_HORIZON_DAYS = 14;
 const MAX_HORIZON_DAYS = 120;
 const FACTOR_MIN = 0.5;
@@ -233,15 +245,57 @@ function compareTasks(a: PlannerTask, b: PlannerTask): number {
   return a.id < b.id ? -1 : 1;
 }
 
+function clamp(value: number | undefined, fallback: number, min: number, max: number): number {
+  const v = Math.round(Number(value ?? fallback));
+  return Number.isFinite(v) ? Math.min(max, Math.max(min, v)) : fallback;
+}
+
+export function minSessionOf(input: Pick<PlanInput, "minSessionMinutes">): number {
+  return clamp(input.minSessionMinutes, DEFAULT_MIN_SESSION_MINUTES, SHORT_FINAL_MINUTES, 120);
+}
+
+/** Busy events extended by the transition buffer; kept study sessions are left as they are. */
+export function effectiveBlocked(input: Pick<PlanInput, "blocked" | "bufferMinutes">): Interval[] {
+  const buffer = clamp(input.bufferMinutes, DEFAULT_BUFFER_MINUTES, 0, 120) * MINUTE;
+  return input.blocked.map((b) => (b.kind === "session" ? { ...b } : { start: b.start, end: b.end + buffer, kind: b.kind }));
+}
+
+/**
+ * Length of the next session for a task with `remaining` minutes left, given `room`
+ * minutes free in the current slot. 0 = nothing useful fits here.
+ * - Sessions are at least `min` long, except a final session of at least `shortFinal`.
+ * - A tail under `shortFinal` is folded into this session (up to `max + shortFinal`) or
+ *   the split is shifted so the rest is a real session.
+ */
+export function chunkLength(remaining: number, room: number, max: number, min: number, shortFinal: number): number {
+  if (remaining < shortFinal) return 0;
+  if (room < Math.min(remaining, min)) return 0;
+  const len = Math.min(max, remaining, room);
+  const tail = remaining - len;
+  if (tail === 0) return len;
+  if (tail < shortFinal && remaining <= max + shortFinal && room >= remaining) return remaining;
+  if (tail < min) {
+    const shifted = len - (min - tail); // leaves exactly one minimum session
+    if (shifted >= min) return shifted;
+    if (tail >= shortFinal) return len; // the rest becomes a short final session
+    const toShortFinal = len - (shortFinal - tail);
+    if (toShortFinal >= min) return toShortFinal;
+  }
+  return len;
+}
+
 /**
  * Earliest-deadline-first greedy planner.
  * Each task fills the earliest free time before its deadline in sessions of
- * at most `sessionMinutes`, with `breakMinutes` reserved after every session.
+ * at most `sessionMinutes` and at least `minSessionMinutes`, with `breakMinutes`
+ * reserved after every session and `bufferMinutes` kept free after busy events.
  * Work that does not fit is reported as a shortfall, never silently dropped.
  */
 export function planSchedule(input: PlanInput): PlanResult {
   const now = ceilTo(input.now.getTime(), 15);
-  const sessionLen = Math.max(MIN_SESSION_MINUTES, Math.round(input.sessionMinutes));
+  const minLen = minSessionOf(input);
+  const shortFinal = Math.min(SHORT_FINAL_MINUTES, minLen);
+  const sessionLen = Math.max(minLen, Math.round(input.sessionMinutes));
   const breakLen = Math.max(0, Math.round(input.breakMinutes));
   const maxEnd = now + MAX_HORIZON_DAYS * DAY;
   const noDeadlineEnd = now + NO_DEADLINE_HORIZON_DAYS * DAY;
@@ -251,7 +305,8 @@ export function planSchedule(input: PlanInput): PlanResult {
     Math.min(t.deadline ? deadlineEnd(t.deadline) : noDeadlineEnd, maxEnd);
   const horizon = tasks.reduce((max, t) => Math.max(max, limitFor(t)), now);
 
-  const free = freeIntervals(input.availability, input.blocked, now, horizon);
+  const blocked = effectiveBlocked(input);
+  const free = freeIntervals(input.availability, blocked, now, horizon);
   const blocks: PlannedBlock[] = [];
   const shortfalls: Shortfall[] = [];
 
@@ -270,28 +325,24 @@ export function planSchedule(input: PlanInput): PlanResult {
         const start = ceilTo(slot.start, 5);
         const usableEnd = Math.min(slot.end, limit);
         const room = Math.floor((usableEnd - start) / MINUTE);
-        const minChunk = Math.min(MIN_SESSION_MINUTES, remaining);
-        if (room < minChunk) break;
-        let len = Math.min(sessionLen, remaining, room);
-        // Avoid leaving a tiny tail (e.g. 50 + 5 min): shorten this block so the rest is a real session.
-        const leftover = remaining - len;
-        if (leftover > 0 && leftover < MIN_SESSION_MINUTES && remaining - MIN_SESSION_MINUTES >= MIN_SESSION_MINUTES) {
-          len = Math.min(len, remaining - MIN_SESSION_MINUTES);
-        }
+        const len = chunkLength(remaining, room, sessionLen, minLen, shortFinal);
+        if (len === 0) break;
         const end = start + len * MINUTE;
-        blocks.push({ taskId: task.id, start, end });
+        blocks.push(len < minLen ? { taskId: task.id, start, end, short: true } : { taskId: task.id, start, end });
         remaining -= len;
         slot.start = end + breakLen * MINUTE;
       }
     }
 
     if (remaining > 0) {
-      shortfalls.push({ taskId: task.id, minutes: remaining, reason: "not_enough_time" });
+      // A leftover too small for any session is reported separately, never shown as scheduled
+      const reason = remaining < shortFinal ? "below_minimum" : "not_enough_time";
+      shortfalls.push({ taskId: task.id, minutes: remaining, reason });
     }
   }
 
   blocks.sort((a, b) => a.start - b.start);
-  assertNoOverlap(blocks, input.blocked);
+  assertNoOverlap(blocks, blocked);
 
   return {
     blocks,

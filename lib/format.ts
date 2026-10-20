@@ -52,3 +52,10 @@ export function todayISO(): string {
   const pad = (n: number) => String(n).padStart(2, "0");
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
 }
+
+/** True for events that cover whole local days (midnight to midnight), e.g. imported all-day events. */
+export function isAllDay(start: number, end: number): boolean {
+  const s = new Date(start);
+  const e = new Date(end);
+  return s.getHours() === 0 && s.getMinutes() === 0 && e.getHours() === 0 && e.getMinutes() === 0 && end - start >= 23 * 3600_000;
+}

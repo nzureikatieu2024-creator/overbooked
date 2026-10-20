@@ -40,3 +40,30 @@ Confirmed events are saved as `busy_events` with `external_uid` = event UID + or
 
 Per-difficulty factor = actual ÷ planned minutes over completed sessions of tasks with that difficulty (from 2 sessions, clamped 0.5–2). Because plans already multiply estimates by the overall factor, the suggestion is `estimate × difficulty factor ÷ overall factor`. It is only applied when the user clicks it.
 
+
+## Password recovery
+
+`/login` → "Forgot password?" → `/forgot-password` calls `resetPasswordForEmail` with `redirectTo = <current site>/reset-password` (PKCE flow, the default for `@supabase/ssr`). The default Supabase "Reset Password" email template (`{{ .ConfirmationURL }}`) works as is: Supabase verifies the token and redirects to `/reset-password?code=…`.
+
+`/reset-password` (`lib/recovery-flow.ts`) exchanges that code exactly once per page load (React Strict Mode mounts twice in development), keeps it in the URL until verification has finished, and also accepts `?token_hash=…&type=recovery` and `#access_token=…&type=recovery` links. Only after a recovery session exists can the user set a new password (`updateUser`); other devices are then signed out.
+
+Supabase dashboard → Authentication → URL Configuration:
+
+- **Site URL:** `https://overbooked-black.vercel.app`
+- **Redirect URLs:** `https://overbooked-black.vercel.app/**` and `http://localhost:3000/**`
+
+PKCE links must be opened in the browser that requested them. For links that work on any device, change the Reset Password template link to `{{ .SiteURL }}/reset-password?token_hash={{ .TokenHash }}&type=recovery` (note: this always uses the Site URL, i.e. production).
+
+## Database migrations
+
+Run each file in `supabase/migrations/` once in the SQL Editor (all are additive and safe to re-run). `002_planner_preferences.sql` adds: minimum session length and transition buffer settings, non-blocking ("info only") busy events, and archived tasks. Until it is run, the app keeps working with the defaults (30-minute minimum, 15-minute buffer) and those controls are disabled.
+
+## Scheduling rules
+
+- Sessions are between the shortest (default 30 min) and longest (default 50 min) length. A final session may be shorter, but at least 15 minutes, and is labelled "short". A leftover under 15 minutes is folded into the previous session when there is room, otherwise reported as too short to schedule; it is never counted as scheduled.
+- After every blocking busy event, a transition buffer (default 15 min) stays free. Study sessions stay inside the preferred study hours.
+- All-day imported events are "info only" by default and never block study time unless marked "Blocks study".
+
+## What-if simulator and deadline risk
+
+`lib/plan-input.ts` builds the exact input Replan uses. `lib/whatif.ts` applies scenario changes (lost study time on a date, extra hours for a task) to a copy and runs the real `planSchedule` on both, so previews never touch saved data. Nothing is written unless the user clicks "Apply to my plan" and confirms. `lib/risk.ts` compares each task's remaining work with free study time and earlier deadlines before its deadline.
